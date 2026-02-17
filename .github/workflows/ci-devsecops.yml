@@ -1,0 +1,146 @@
+name: CI DevSecOps
+
+on:
+  push:
+    branches: ["main"]
+
+env:
+  PYTHON_VERSION: "3.11"
+  # Menggunakan format yang lebih bersih untuk nama image
+  CONTAINER_IMAGE: ${{ vars.CONTAINER_IMAGE || format('{0}/todo-python', secrets.DOCKERHUB_USERNAME) }}
+
+jobs:
+  # --- Tahap 1: Testing ---
+  unit_test:
+    name: Unit Test (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade "setuptools >= 78.1.1, < 79.0.0"
+          pip install -r requirements.txt
+
+  # --- Tahap 2: Security Scans (Parallel) ---
+  sast_bandit:
+    name: SAST (Bandit)
+    runs-on: ubuntu-latest
+    needs: [unit_test]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run Bandit
+        run: |
+          pip install bandit
+          bandit -r app -f json -o bandit-report.json
+
+      - name: Upload Bandit Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  sca_pip_audit:
+    name: SCA (pip-audit)
+    runs-on: ubuntu-latest
+    needs: [unit_test]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --strict --progress-spinner=off --format json > pip-audit.json
+
+      - name: Upload SCA Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-report
+          path: pip-audit.json
+
+  secret_scan_gitleaks:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    needs: [unit_test]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Penting untuk gitleaks agar bisa scan history
+
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: "--no-banner --report-format json --report-path gitleaks.json --exit-code 1"
+
+      - name: Upload Gitleaks Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks.json
+
+  # --- Tahap 3: Build & Push ---
+  build_and_push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [sast_bandit, sca_pip_audit, secret_scan_gitleaks]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Short SHA
+        id: vars
+        run: echo "sha_short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.CONTAINER_IMAGE }}:latest
+            ${{ env.CONTAINER_IMAGE }}:${{ steps.vars.outputs.sha_short }}
+
+  # --- Tahap 4: Post-Build Scanning ---
+  image_scan_trivy:
+    name: Image Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs:
